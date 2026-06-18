@@ -9,10 +9,9 @@ admin.initializeApp({
 const db = admin.firestore();
 const messaging = admin.messaging();
 
-const GROW_INTERVAL  = 48 * 60 * 60 * 1000;
-const WATER_INTERVAL = 12 * 60 * 60 * 1000;
-const ROT_INTERVAL   = 4  * 24 * 60 * 60 * 1000;
-const FERT_INTERVAL  = 4  * 60 * 60 * 1000;
+const GROW_INTERVAL = 48 * 60 * 60 * 1000;
+const ROT_INTERVAL  = 4  * 24 * 60 * 60 * 1000;
+const FERT_INTERVAL = 4  * 60 * 60 * 1000;
 
 const sent = new Set();
 
@@ -20,12 +19,11 @@ function now() { return Date.now(); }
 
 async function getFCMTokens() {
   const snap = await db.collection('fcmTokens').get();
-  // Nur einzigartige Tokens - neuesten pro Token behalten
   const tokenMap = new Map();
   snap.docs.forEach(d => {
     const { token, updatedAt } = d.data();
     if (!token) return;
-    if (!tokenMap.has(token) || (updatedAt > (tokenMap.get(token)?.updatedAt || 0))) {
+    if (!tokenMap.has(token) || updatedAt > (tokenMap.get(token)?.updatedAt || 0)) {
       tokenMap.set(token, { token, updatedAt });
     }
   });
@@ -46,13 +44,17 @@ async function sendPush(tokens, title, body) {
   }
 }
 
-function check(id, key, condition, resetCondition, onSend) {
-  if (resetCondition) { sent.delete(id + key); return; }
-  if (condition && !sent.has(id + key)) {
-    sent.add(id + key);
-    onSend();
+// Schickt nur wenn noch nicht in dieser "Minute" gesendet
+function triggerKey(id, key, mins) {
+  // Key enthält die aktuelle Minute damit er sich nach 2 Minuten selbst zurücksetzt
+  const minuteKey = `${id}${key}_${Math.floor(now() / 60000)}`;
+  if (sent.has(minuteKey)) return false;
+  // Alle anderen minuten-Keys für diesen id+key löschen
+  for (const k of sent) {
+    if (k.startsWith(id + key + '_')) sent.delete(k);
   }
-  if (!condition && !resetCondition) sent.delete(id + key);
+  sent.add(minuteKey);
+  return true;
 }
 
 async function checkTimers() {
@@ -68,50 +70,38 @@ async function checkTimers() {
 
     // Rübe reif
     const ripeLeft = Math.max(0, (b.plantedAt || t) + GROW_INTERVAL - t);
-    check(b.id, '_reif',
-      ripeLeft === 0,
-      ripeLeft > 60000,
-      () => sendPush(tokens, '🟫 Rübe reif!', `${name} ist jetzt reif!`)
-    );
+    if (ripeLeft === 0 && triggerKey(b.id, '_reif', 0)) {
+      sendPush(tokens, '🟫 Rübe reif!', `${name} ist jetzt reif!`);
+    }
+    if (ripeLeft > 60000) sent.forEach(k => k.startsWith(b.id + '_reif') && sent.delete(k));
 
     // Wasser 15 Min
     const waterLeft = Math.max(0, (b.waterUntil || 0) - t);
-    check(b.id, '_w15',
-      waterLeft > 0 && waterLeft <= 15*60000 && waterLeft > 14*60000,
-      waterLeft > 15*60000,
-      () => sendPush(tokens, '💧 Wasser fast leer', `${name}: Wasser läuft in ~15 Min aus!`)
-    );
+    if (waterLeft > 0 && waterLeft <= 15*60000 && waterLeft > 14*60000 && triggerKey(b.id, '_w15', 15)) {
+      sendPush(tokens, '💧 Wasser fast leer', `${name}: Wasser läuft in ~15 Min aus!`);
+    }
 
     // Wasser abgelaufen
-    check(b.id, '_w0',
-      waterLeft === 0 && (b.waterUntil || 0) > 0,
-      waterLeft > 60000,
-      () => sendPush(tokens, '🚱 Wasser leer!', `${name}: Kein Wasser – Verdorrung läuft!`)
-    );
+    if (waterLeft === 0 && (b.waterUntil || 0) > 0 && triggerKey(b.id, '_w0', 0)) {
+      sendPush(tokens, '🚱 Wasser leer!', `${name}: Kein Wasser – Verdorrung läuft!`);
+    }
 
     // Verdorrung 1h, 30min, 10min
     if (waterLeft === 0) {
       const rotLeft = Math.max(0, (b.waterUntil || 0) + ROT_INTERVAL - t);
       [[60,'_r60'],[30,'_r30'],[10,'_r10']].forEach(([mins, key]) => {
-        check(b.id, key,
-          rotLeft <= mins*60000 && rotLeft > (mins-1)*60000,
-          rotLeft > mins*60000,
-          () => sendPush(tokens, '⚠️ Verdorrung!', `${name}: Verdirbt in ~${mins} Min!`)
-        );
+        if (rotLeft <= mins*60000 && rotLeft > (mins-1)*60000 && triggerKey(b.id, key, mins)) {
+          sendPush(tokens, '⚠️ Verdorrung!', `${name}: Verdirbt in ~${mins} Min!`);
+        }
       });
-    } else {
-      // Wasser wieder da – Verdorrungs-Flags zurücksetzen
-      ['_r60','_r30','_r10'].forEach(k => sent.delete(b.id + k));
     }
 
     // Dünger 30min, 15min
     const fertLeft = Math.max(0, (b.fertAt || 0) + FERT_INTERVAL - t);
     [[30,'_f30'],[15,'_f15']].forEach(([mins, key]) => {
-      check(b.id, key,
-        fertLeft > 0 && fertLeft <= mins*60000 && fertLeft > (mins-1)*60000,
-        fertLeft > mins*60000,
-        () => sendPush(tokens, '🌿 Dünger läuft ab', `${name}: Dünger endet in ~${mins} Min!`)
-      );
+      if (fertLeft > 0 && fertLeft <= mins*60000 && fertLeft > (mins-1)*60000 && triggerKey(b.id, key, mins)) {
+        sendPush(tokens, '🌿 Dünger läuft ab', `${name}: Dünger endet in ~${mins} Min!`);
+      }
     });
   });
 }

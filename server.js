@@ -20,7 +20,16 @@ function now() { return Date.now(); }
 
 async function getFCMTokens() {
   const snap = await db.collection('fcmTokens').get();
-  return snap.docs.map(d => d.data().token).filter(Boolean);
+  // Nur einzigartige Tokens - neuesten pro Token behalten
+  const tokenMap = new Map();
+  snap.docs.forEach(d => {
+    const { token, updatedAt } = d.data();
+    if (!token) return;
+    if (!tokenMap.has(token) || (updatedAt > (tokenMap.get(token)?.updatedAt || 0))) {
+      tokenMap.set(token, { token, updatedAt });
+    }
+  });
+  return [...tokenMap.keys()];
 }
 
 async function sendPush(tokens, title, body) {
@@ -109,4 +118,4 @@ async function checkTimers() {
 
 console.log('[Rübe] Push-Server gestartet.');
 checkTimers();
-setInterval(checkTimers, 30000);
+setInterval(checkTimers, 10000);

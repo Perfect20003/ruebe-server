@@ -13,9 +13,9 @@ const GROW_INTERVAL = 48 * 60 * 60 * 1000;
 const ROT_INTERVAL  = 4  * 24 * 60 * 60 * 1000;
 const FERT_INTERVAL = 4  * 60 * 60 * 1000;
 
-// Cache in Firestore: settings/pushCache
 const pushCacheRef = db.doc('settings/pushCache');
-let cache = {}; // { key: timestamp }
+let cache = {};
+let isFirstRun = true; // Beim ersten Durchlauf nur Cache aufbauen, nicht senden
 
 async function loadCache() {
   try {
@@ -28,9 +28,7 @@ async function loadCache() {
 }
 
 async function saveCache() {
-  try {
-    await pushCacheRef.set(cache);
-  } catch(e) {}
+  try { await pushCacheRef.set(cache); } catch(e) {}
 }
 
 function tryTrigger(key) {
@@ -63,7 +61,7 @@ async function getFCMTokens() {
 }
 
 async function sendPush(tokens, title, body) {
-  if (!tokens.length) return;
+  if (!tokens.length || isFirstRun) return;
   try {
     await messaging.sendEachForMulticast({
       tokens,
@@ -78,8 +76,6 @@ async function sendPush(tokens, title, body) {
 
 async function checkTimers() {
   const tokens = await getFCMTokens();
-  if (!tokens.length) return;
-
   const beetSnap = await db.collection('beete').get();
   const t = now();
 
@@ -99,20 +95,21 @@ async function checkTimers() {
       if (tryTrigger(b.id + '_w15')) sendPush(tokens, '💧 Wasser fast leer', `${name}: Wasser läuft in ~15 Min aus!`);
     } else if (waterLeft > 20 * 60000) clearTrigger(b.id + '_w15');
 
-    // Wasser abgelaufen
-    if (waterLeft === 0 && (b.waterUntil || 0) > 0) {
+    // Wasser abgelaufen – nur wenn waterUntil in den letzten 10 Min abgelaufen ist
+    const waterUntil = b.waterUntil || 0;
+    if (waterLeft === 0 && waterUntil > 0 && (t - waterUntil) < 10 * 60000) {
       if (tryTrigger(b.id + '_w0')) sendPush(tokens, '🚱 Wasser leer!', `${name}: Kein Wasser – Verdorrung läuft!`);
     } else if (waterLeft > 60000) clearTrigger(b.id + '_w0');
 
     // Verdorrung
-    if (waterLeft === 0) {
-      const rotLeft = Math.max(0, (b.waterUntil || 0) + ROT_INTERVAL - t);
+    if (waterLeft === 0 && waterUntil > 0) {
+      const rotLeft = Math.max(0, waterUntil + ROT_INTERVAL - t);
       [[60,'_r60'],[30,'_r30'],[10,'_r10']].forEach(([mins, key]) => {
         if (rotLeft <= mins * 60000) {
           if (tryTrigger(b.id + key)) sendPush(tokens, '⚠️ Verdorrung!', `${name}: Verdirbt in ~${mins} Min!`);
         } else if (rotLeft > (mins + 5) * 60000) clearTrigger(b.id + key);
       });
-    } else {
+    } else if (waterLeft > 0) {
       ['_r60','_r30','_r10'].forEach(k => clearTrigger(b.id + k));
     }
 
@@ -124,12 +121,18 @@ async function checkTimers() {
       } else if (fertLeft > (mins + 5) * 60000) clearTrigger(b.id + key);
     });
   });
+
+  // Nach dem ersten Durchlauf: Senden freischalten
+  if (isFirstRun) {
+    isFirstRun = false;
+    console.log('[Push] Initialer Scan abgeschlossen. Sende ab jetzt Benachrichtigungen.');
+  }
 }
 
 async function main() {
   await loadCache();
   console.log('[Rübe] Push-Server gestartet.');
-  checkTimers();
+  await checkTimers(); // Erster Durchlauf: nur Cache aufbauen
   setInterval(checkTimers, 10000);
 }
 
